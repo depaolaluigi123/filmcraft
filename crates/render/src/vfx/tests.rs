@@ -1009,8 +1009,16 @@ fn posterize_time_and_echo_read_other_frames() {
     assert!(close(img.get(40, 4)[0], 0.5, 1e-5), "echo bar {:?}", img.get(40, 4));
 }
 
+/// The stabilizer analysis cache is process-global; these tests clear and fill it, so they must not
+/// run at the same time or one test's `clear` would empty another test's cache mid-render.
+fn stabilizer_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn warp_stabilizer_removes_camera_jitter() {
+    let _guard = stabilizer_test_lock();
     let (w, h) = (192, 128);
     let mk = |now: f64| ClipEnv { w, h, fps: 24.0, secs: 1.0, now, key: 0xC0FFEE, seq: (w as u32, h as u32), pic: shaky };
     let mut e = inst("warp_stabilizer");
@@ -1062,6 +1070,7 @@ fn warp_stabilizer_removes_camera_jitter() {
 
 #[test]
 fn warp_stabilizer_only_reads_a_cached_analysis() {
+    let _guard = stabilizer_test_lock();
     let (w, h) = (96, 64);
     let mk = |now: f64| ClipEnv { w, h, fps: 24.0, secs: 1.0, now, key: 0x5A17_AB1E, seq: (w as u32, h as u32), pic: shaky };
     clear_stabilizer_cache();
@@ -1084,6 +1093,48 @@ fn warp_stabilizer_only_reads_a_cached_analysis() {
     let mut img = raw.clone();
     crate::effects::apply(&mut img, &e, &FxCtx { seconds: 0.2, env: Some(&env), ..cx() });
     assert_eq!(img.px, raw.px);
+}
+
+#[test]
+fn warp_stabilizer_uses_the_analysis_saved_in_the_project() {
+    let _guard = stabilizer_test_lock();
+    let (w, h) = (192, 128);
+    let mk = |now: f64, key: u64| ClipEnv { w, h, fps: 24.0, secs: 1.0, now, key, seq: (w as u32, h as u32), pic: shaky };
+    let method = filmcraft_project::TrackMethod::PositionScaleRotation;
+    let fresh = mk(0.0, 0x5EED);
+    clear_stabilizer_cache();
+    let path = stabilizer_path(&fresh, 0.0, method, false).unwrap();
+    let mut e = inst("warp_stabilizer");
+    set(&mut e, "result", ParamValue::Choice(1)); // No Motion
+    set(&mut e, "framing", ParamValue::Choice(0)); // Stabilize Only
+    set(&mut e, "stabilize", ParamValue::Bool(true));
+    e.analysis = Some(path.to_analysis(fresh.clip_key(), method, false));
+    // a reopened project has no in-memory cache: only the analysis saved with the effect remains
+    clear_stabilizer_cache();
+    assert!(cached_stabilizer_path(&fresh, method, false).is_none());
+    let now = 9.0 / 24.0;
+    let env = mk(now, fresh.key);
+    let raw = env.render(now, 1.0);
+    let mut st = raw.clone();
+    crate::effects::apply(&mut st, &e, &FxCtx { seconds: now, env: Some(&env), ..cx() });
+    assert_ne!(st.px, raw.px, "the saved analysis stabilises the clip after reopening the project");
+    // a clip that moved or was trimmed no longer matches the saved analysis and stays untouched
+    clear_stabilizer_cache();
+    let moved = mk(now, fresh.key + 1);
+    let raw = moved.render(now, 1.0);
+    let mut img = raw.clone();
+    crate::effects::apply(&mut img, &e, &FxCtx { seconds: now, env: Some(&moved), ..cx() });
+    assert_eq!(img.px, raw.px, "a stored analysis is ignored once the clip key changed");
+    // a damaged analysis is ignored rather than applied
+    clear_stabilizer_cache();
+    if let Some(a) = e.analysis.as_mut() {
+        a.steps = "not base64!!".to_string();
+    }
+    let env = mk(now, fresh.key);
+    let raw = env.render(now, 1.0);
+    let mut img = raw.clone();
+    crate::effects::apply(&mut img, &e, &FxCtx { seconds: now, env: Some(&env), ..cx() });
+    assert_eq!(img.px, raw.px, "a damaged saved analysis is ignored");
 }
 
 #[test]

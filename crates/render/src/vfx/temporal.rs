@@ -229,6 +229,23 @@ pub struct StabilizerPath {
     pub fps: f64,
 }
 
+impl StabilizerPath {
+    /// The project-storable form of this analysis. `clip` is the [`FxEnv::clip_key`] of the clip it
+    /// was taken from; the analysis is only used again while that still matches.
+    pub fn to_analysis(&self, clip: u64, method: TrackMethod, detailed: bool) -> filmcraft_project::effect::StabilizerAnalysis {
+        let packed: Vec<[f32; 4]> = self.steps.iter().map(|m| decompose(m).map(|v| v as f32)).collect();
+        filmcraft_project::effect::StabilizerAnalysis {
+            clip,
+            fps: self.fps,
+            width: self.w.min(u32::MAX as usize) as u32,
+            height: self.h.min(u32::MAX as usize) as u32,
+            method,
+            detailed,
+            steps: filmcraft_project::effect::pack_steps(&packed),
+        }
+    }
+}
+
 type PathCache = Mutex<HashMap<u64, Arc<StabilizerPath>>>;
 fn path_cache() -> &'static PathCache {
     static C: OnceLock<PathCache> = OnceLock::new();
@@ -250,6 +267,34 @@ fn path_key(env: &dyn FxEnv, method: TrackMethod, detailed: bool) -> u64 {
 /// reads the cache: applying Warp Stabilizer never starts an analysis on its own.
 pub fn cached_stabilizer_path(env: &dyn FxEnv, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
     path_cache().lock().ok().and_then(|c| c.get(&path_key(env, method, detailed)).cloned())
+}
+
+/// The analysis saved in the project for `e`, if it still matches the clip `env` describes and the
+/// current tracking method. This is what keeps a stabilised clip stabilised after reopening the
+/// project (or on another computer) without pressing Stabilize again: rendering falls back to it
+/// when the in-memory cache is empty, and caches it like a fresh analysis.
+pub fn stored_stabilizer_path(env: &dyn FxEnv, e: &EffectInstance, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
+    let a = e.analysis.as_ref()?;
+    if a.clip != env.clip_key() || a.method != method || a.detailed != detailed {
+        return None;
+    }
+    // hostile or damaged files: a bad size or non-finite step could otherwise poison the warp
+    if !a.fps.is_finite() || a.fps <= 0.0 || !(1..=16_384).contains(&a.width) || !(1..=16_384).contains(&a.height) {
+        return None;
+    }
+    let packed = filmcraft_project::effect::unpack_steps(&a.steps)?;
+    if packed.iter().flatten().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let steps: Vec<Affine> = packed.into_iter().map(|p| compose([p[0] as f64, p[1] as f64, p[2] as f64, p[3] as f64])).collect();
+    let path = Arc::new(StabilizerPath { w: a.width as usize, h: a.height as usize, steps, fps: a.fps });
+    if let Ok(mut c) = path_cache().lock() {
+        if c.len() > 64 {
+            c.clear();
+        }
+        c.insert(path_key(env, method, detailed), path.clone());
+    }
+    Some(path)
 }
 
 /// Analyse the clip `env` describes, or fetch its cached analysis. This is the explicit analysis
@@ -418,7 +463,9 @@ pub fn warp_stabilizer(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         return;
     }
     let method = if chv(e, "method") == 0 { TrackMethod::Position } else { TrackMethod::PositionScaleRotation };
-    let Some(path) = cached_stabilizer_path(env, method, bv(e, "detailed")) else { return };
+    let detailed = bv(e, "detailed");
+    // a fresh analysis in memory wins; otherwise the one saved in the project (reopened file)
+    let Some(path) = cached_stabilizer_path(env, method, detailed).or_else(|| stored_stabilizer_path(env, e, method, detailed)) else { return };
     let n = path.steps.len() + 1;
     let k = ((cx.seconds * path.fps).round().max(0.0) as usize).min(n - 1);
     let smooth = fv(e, "smoothness", cx) as f64 / 100.0 * path.fps;

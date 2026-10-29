@@ -163,19 +163,20 @@ impl FxEnv for ItemEnv<'_> {
         crate::source_size(self.project, self.item.item).unwrap_or((self.seq.settings.width, self.seq.settings.height))
     }
     fn clip_key(&self) -> u64 {
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for v in [
-            self.item.item.0,
-            self.item.start.0 as u64,
-            self.item.duration.0 as u64,
-            self.item.source_in.0 as u64,
-            self.item.speed.to_bits(),
-            self.item.reverse as u64,
-        ] {
-            h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
-        }
-        h
+        clip_key(self.item)
     }
+}
+
+/// FNV-1a identity of a clip instance and the source range an analysis covers (media item,
+/// timeline start and duration, source in-point, speed and reverse). The in-memory analysis cache
+/// and a project-stored analysis use the same key, so both invalidate together when the clip moves
+/// or its source range changes.
+pub fn clip_key(item: &TrackItem) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [item.item.0, item.start.0 as u64, item.duration.0 as u64, item.source_in.0 as u64, item.speed.to_bits(), item.reverse as u64] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// Analyse `item` for Warp Stabilizer without rendering it: the clip's frames are decoded small

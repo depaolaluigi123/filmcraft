@@ -10,8 +10,10 @@
 //! stops the job and clears the flag in one step.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use filmcraft_project::effect::StabilizerAnalysis;
 use filmcraft_project::{ClipId, ItemId, ParamValue, TrackItem, TrackMethod};
 use serde_json::{Value, json};
 
@@ -28,6 +30,8 @@ pub struct PendingStabilizer {
     /// Cooperative cancellation for the analysis threads (the job's own flag as well, so
     /// `jobs.cancel` reaches both).
     stop: Arc<AtomicBool>,
+    /// The finished analysis, attached by the worker and saved into the effect by [`poll`].
+    analysis: Arc<Mutex<Option<StabilizerAnalysis>>>,
 }
 
 pub(crate) fn commands() -> Vec<CommandSpec> {
@@ -94,14 +98,24 @@ pub fn cancel(s: &mut Session, clip: ClipId, effect: usize) {
     }
 }
 
-/// Set the effect's `stabilize` parameter.
+/// One undo step for pressing Stabilize and the analysis finishing: the flag edit and the saved
+/// analysis merge while nothing else was edited in between.
+fn merge_key(clip: ClipId, effect: usize) -> String {
+    format!("stabilize:{}:{effect}", clip.0)
+}
+
+/// Set the effect's `stabilize` parameter; turning it off also drops any stored analysis.
 fn set_flag(s: &mut Session, clip: ClipId, effect: usize, on: bool) -> Result<()> {
-    s.edit_sequence(if on { "Stabilize Clip" } else { "Stop Stabilizing" }, |q, _, _| {
+    let key = merge_key(clip, effect);
+    s.edit_sequence_as(if on { "Stabilize Clip" } else { "Stop Stabilizing" }, Some(&key), |q, _, _| {
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
         let e = it.effects.get_mut(effect).ok_or_else(|| bad("effects.stabilize", "the effect is gone"))?;
         if let Some(p) = e.param_mut("stabilize") {
             p.value = ParamValue::Bool(on);
             p.keyframes.clear();
+        }
+        if !on {
+            e.analysis = None;
         }
         Ok(())
     })
@@ -146,6 +160,8 @@ fn stabilize(s: &mut Session, p: &Value) -> Result<Value> {
     let (p_for_frames, status) = (prog.clone(), prog.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_run = stop.clone();
+    let analysis_slot: Arc<Mutex<Option<StabilizerAnalysis>>> = Arc::new(Mutex::new(None));
+    let analysis_for_run = analysis_slot.clone();
     let start = web_time::Instant::now();
     let run = move || {
         let on_frame = move |k: usize| {
@@ -158,7 +174,9 @@ fn stabilize(s: &mut Session, p: &Value) -> Result<Value> {
         let stopped = prog.cancel.load(Ordering::Relaxed) || stop_for_run.load(Ordering::Relaxed);
         let seconds = start.elapsed().as_secs_f64();
         let r = match analysis {
-            Some(_) if !stopped => {
+            Some(path) if !stopped => {
+                // hand the analysis to `poll`, which saves it into the effect's project data
+                *analysis_for_run.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_analysis(filmcraft_render::vfx::clip_key(&item), method, detailed));
                 *prog.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Stabilized {frames} frame(s) in {seconds:.1}s");
                 Ok(filmcraft_export::Report {
                     path: String::new(),
@@ -184,7 +202,7 @@ fn stabilize(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     s.jobs.push(job);
-    s.stabilizer_jobs.push(PendingStabilizer { job: id, clip, effect: idx, seq: seq_id, stop });
+    s.stabilizer_jobs.push(PendingStabilizer { job: id, clip, effect: idx, seq: seq_id, stop, analysis: analysis_slot });
     let wait = bool_p(p, "wait").unwrap_or(false) || cfg!(target_arch = "wasm32");
     if wait {
         run();
@@ -220,13 +238,14 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Remove finished analyses from the pending list (the job itself stays in `jobs` for the Events
-/// panel / progress UI) and report a failure that was not a user stop.
+/// panel / progress UI), save a successful analysis into the effect's project data and report a
+/// failure that was not a user stop.
 pub fn poll(s: &mut Session) {
     let mut i = 0;
     while i < s.stabilizer_jobs.len() {
-        let (job_id, seq) = {
+        let (job_id, seq, clip, effect) = {
             let pj = &s.stabilizer_jobs[i];
-            (pj.job, pj.seq)
+            (pj.job, pj.seq, pj.clip, pj.effect)
         };
         let Some(job) = s.jobs.iter().find(|j| j.id == job_id) else {
             s.stabilizer_jobs.remove(i);
@@ -239,7 +258,15 @@ pub fn poll(s: &mut Session) {
         let stopped = job.progress.cancel.load(Ordering::Relaxed);
         let error = job.progress.error.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let failed = job.result.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.is_err());
+        let analysis = s.stabilizer_jobs[i].analysis.lock().unwrap_or_else(|e| e.into_inner()).take();
         s.stabilizer_jobs.remove(i);
+        if !stopped
+            && !failed
+            && error.is_none()
+            && let Some(a) = analysis
+        {
+            store_analysis(s, seq, clip, effect, a);
+        }
         if s.state.active_sequence != Some(seq) {
             continue;
         }
@@ -247,6 +274,32 @@ pub fn poll(s: &mut Session) {
             let msg = error.unwrap_or_else(|| "Warp Stabilizer analysis failed".into());
             s.error_toast("effects.stabilize", format!("Warp Stabilizer: {msg}"));
         }
+    }
+}
+
+/// Save a finished analysis into the effect, unless the clip changed while it ran (its key no
+/// longer matches) or the effect is gone or no longer stabilizing.
+fn store_analysis(s: &mut Session, seq: ItemId, clip: ClipId, effect: usize, a: StabilizerAnalysis) {
+    let Some(current) = s.project.sequence(seq).and_then(|q| q.find_item(clip)).map(|(_, it)| it.clone()) else { return };
+    if filmcraft_render::vfx::clip_key(&current) != a.clip {
+        return;
+    }
+    let Some(e) = current.effects.get(effect) else { return };
+    if e.effect != "warp_stabilizer" || !matches!(e.params.get("stabilize").map(|p| &p.value), Some(ParamValue::Bool(true))) {
+        return;
+    }
+    let key = merge_key(clip, effect);
+    if let Err(err) = s.edit_merged("Stabilize Clip", &key, |p, _| {
+        let Some(q) = p.sequence_mut(seq) else { return Ok(()) };
+        let Some((_, it)) = q.find_item_mut(clip) else { return Ok(()) };
+        if let Some(e) = it.effects.get_mut(effect)
+            && e.effect == "warp_stabilizer"
+        {
+            e.analysis = Some(a);
+        }
+        Ok(())
+    }) {
+        s.error_toast("effects.stabilize", format!("Warp Stabilizer: could not save the analysis: {err}"));
     }
 }
 
