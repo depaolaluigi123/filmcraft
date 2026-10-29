@@ -3660,6 +3660,9 @@ fn build() -> Vec<CommandSpec> {
                     {
                         sp.value = filmcraft_project::ParamValue::Bool(false);
                         sp.keyframes.clear();
+                        // the old analysis belongs to the parameters that were stabilised; a new
+                        // Stabilize press analyses again
+                        e.analysis = None;
                     }
                     // the parameter's definition (a mask's own parameters have none)
                     let def = if pq.get("mask").is_none_or(Value::is_null) { e.def().and_then(|d| d.param(&pid)) } else { None };
@@ -4108,6 +4111,10 @@ fn reset_params(e: &mut filmcraft_project::EffectInstance, only: Option<&str>, f
                 e.params.insert(id, prm);
             }
         }
+    }
+    // resetting the Stabilize parameter (or the whole effect) drops the stored analysis with it
+    if e.effect == "warp_stabilizer" && only.is_none_or(|o| o == "stabilize") {
+        e.analysis = None;
     }
     any
 }
