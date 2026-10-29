@@ -1,7 +1,7 @@
 //! M5.11: every video effect is listed with its folder and badges, applies by id or name through
 //! `effects.apply` (undoable), takes parameters through `effects.setParam`, and renders.
 
-use filmcraft_project::{EffectKind, effect_defs};
+use filmcraft_project::{ClipId, EffectKind, ParamValue, effect_defs};
 use serde_json::{Value, json};
 
 use crate::Session;
@@ -241,4 +241,38 @@ fn transition_duration_is_clamped_to_what_the_cut_supports() {
     let err =
         preview_transition(&s, &json!({"effect": "cross_dissolve", "clip": clips[1].0, "edge": "in", "frames": 5}), TrackKind::Video).unwrap_err().to_string();
     assert!(err.contains("no room for a transition"), "{err}");
+}
+
+/// Warp Stabilizer is button-driven: applying it analyse nothing, the Stabilize command runs the
+/// analysis, and touching any other parameter stops it and clears the flag (the button is needed
+/// again). Stop clears the flag in one step.
+#[test]
+fn warp_stabilizer_is_button_driven_and_parameter_changes_stop_it() {
+    let mut s = demo();
+    let clip = first_v1_clip(&s);
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "warp_stabilizer"})).unwrap();
+    let idx = s.active_sequence().unwrap().find_item(ClipId(clip)).unwrap().1.effects.iter().position(|e| e.effect == "warp_stabilizer").unwrap();
+    let flag = |s: &Session| {
+        s.active_sequence()
+            .and_then(|q| q.find_item(ClipId(clip)))
+            .and_then(|(_, it)| it.effects[idx].params.get("stabilize").map(|p| matches!(p.value, ParamValue::Bool(true))))
+            .unwrap_or(false)
+    };
+    assert!(!flag(&s), "applying the effect does not analyse anything");
+    // the Stabilize button (wait: the test needs the result now) analyses and keeps the flag on
+    let r = s.execute("effects.stabilize", json!({"clip": clip, "effect": idx, "wait": true})).unwrap();
+    assert_eq!(r["effect"], idx);
+    assert!(r["frames"].as_u64().unwrap() > 0);
+    assert!(flag(&s));
+    // touching any other parameter stops it and clears the flag
+    s.execute("effects.setParam", json!({"clip": clip, "effect": idx, "param": "smoothness", "value": 60.0})).unwrap();
+    assert!(!flag(&s));
+    // the button can start it again; Stop clears the flag
+    s.execute("effects.stabilize", json!({"clip": clip, "effect": idx, "wait": true})).unwrap();
+    assert!(flag(&s));
+    s.execute("effects.stopStabilize", json!({"clip": clip, "effect": idx})).unwrap();
+    assert!(!flag(&s));
+    // not a Warp Stabilizer effect
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "gaussian_blur"})).unwrap();
+    assert!(s.execute("effects.stabilize", json!({"clip": clip, "effect": "gaussian_blur", "wait": true})).is_err());
 }

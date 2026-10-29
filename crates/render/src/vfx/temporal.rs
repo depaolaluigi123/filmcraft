@@ -1,9 +1,10 @@
 //! Effects that look at other frames: Posterize Time, Echo, Auto Reframe and Warp Stabilizer.
 //!
-//! Warp Stabilizer is a 2-D (similarity / translation) stabilizer: on first use it analyses the
+//! Warp Stabilizer is a 2-D (similarity / translation) stabilizer: the Stabilize button analyses the
 //! clip — every frame decoded small, Shi–Tomasi features tracked frame to frame with pyramidal
 //! Lucas–Kanade and a RANSAC similarity fit (the mask tracker in [`crate::track`]) — and caches
-//! the per-frame steps in memory. Rendering smooths the accumulated camera path with a Gaussian
+//! the per-frame steps in memory; rendering only reads that cache (it never analyses on its own).
+//! Rendering smooths the accumulated camera path with a Gaussian
 //! (Smoothness) or holds it fixed (No Motion), warps each frame onto the smoothed path and frames
 //! the result (crop / auto-scale / synthesise edges). Perspective and Subspace Warp use the
 //! similarity model (no per-region warping).
@@ -259,6 +260,20 @@ pub(super) fn chunked_steps<T: Send + Sync>(
     step: impl Fn(&T, &T, (usize, usize)) -> Affine + Sync,
     cancelled: impl Fn() -> bool + Sync,
 ) -> Option<(Vec<Affine>, (usize, usize))> {
+    chunked_steps_with(n, block, decode, size, step, cancelled, None)
+}
+
+/// [`chunked_steps`], calling `on_frame` with the frame number as each decoded frame is done.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chunked_steps_with<T: Send + Sync>(
+    n: usize,
+    block: usize,
+    decode: impl Fn(usize) -> Option<T> + Sync,
+    size: impl Fn(&T) -> (usize, usize) + Sync,
+    step: impl Fn(&T, &T, (usize, usize)) -> Affine + Sync,
+    cancelled: impl Fn() -> bool + Sync,
+    on_frame: Option<&(dyn Fn(usize) + Sync)>,
+) -> Option<(Vec<Affine>, (usize, usize))> {
     let block = block.max(1);
     let mut steps = Vec::with_capacity(n.saturating_sub(1));
     let mut dims = None;
@@ -269,7 +284,21 @@ pub(super) fn chunked_steps<T: Send + Sync>(
             return None;
         }
         let end = (next + block).min(n);
-        let fresh: Vec<Option<T>> = (next..end).into_par_iter().map(|k| if cancelled() { None } else { decode(k) }).collect();
+        let fresh: Vec<Option<T>> = (next..end)
+            .into_par_iter()
+            .map(|k| {
+                if cancelled() {
+                    return None;
+                }
+                let frame = decode(k);
+                if frame.is_some()
+                    && let Some(cb) = on_frame
+                {
+                    cb(k);
+                }
+                frame
+            })
+            .collect();
         if cancelled() {
             return None;
         }
@@ -293,9 +322,31 @@ pub(super) fn chunked_steps<T: Send + Sync>(
     Some((steps, dims?))
 }
 
-/// Analyse (or fetch the cached analysis of) the clip `env` describes.
+fn path_key(env: &dyn FxEnv, method: TrackMethod, detailed: bool) -> u64 {
+    env.clip_key() ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1)
+}
+
+/// The cached analysis of the clip `env` describes, if it was analysed already. Rendering only
+/// reads the cache: applying Warp Stabilizer never starts an analysis on its own.
+pub fn cached_stabilizer_path(env: &dyn FxEnv, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
+    path_cache().lock().ok().and_then(|c| c.get(&path_key(env, method, detailed)).cloned())
+}
+
+/// Analyse the clip `env` describes, or fetch its cached analysis. This is the explicit analysis
+/// the Stabilize button runs (in the background); rendering uses [`cached_stabilizer_path`].
 pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
-    let key = env.clip_key() ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1);
+    stabilizer_path_with(env, now, method, detailed, None)
+}
+
+/// [`stabilizer_path`], calling `on_frame` with the frame number as each analysed frame is done.
+pub fn stabilizer_path_with(
+    env: &dyn FxEnv,
+    now: f64,
+    method: TrackMethod,
+    detailed: bool,
+    on_frame: Option<&(dyn Fn(usize) + Sync)>,
+) -> Option<Arc<StabilizerPath>> {
+    let key = path_key(env, method, detailed);
     if let Some(p) = path_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         return Some(p);
     }
@@ -306,7 +357,7 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     let scale = (target_w / src_w).min(1.0);
     // A few frames at a time: holding the pyramid of every frame of a long clip (a 10-minute clip
     // at 30 fps is 18,000 of them) took tens of gigabytes and ended the process (#1381).
-    let (steps, (w, h)) = chunked_steps(
+    let (steps, (w, h)) = chunked_steps_with(
         n,
         ANALYSIS_BLOCK,
         |k| env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f))),
@@ -317,6 +368,7 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
             track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY)
         },
         filmcraft_media::cancel::cancelled,
+        on_frame,
     )?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
@@ -482,8 +534,13 @@ pub(crate) fn cover_scale(corr: &Affine, w: f64, h: f64, max: f64) -> f64 {
 /// Warp Stabilizer: see the module docs.
 pub fn warp_stabilizer(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let Some(env) = cx.env else { return };
+    // the Stabilize button analyses the clip (and sets this parameter); rendering only uses a
+    // cached analysis and a parameter change clears the flag, so nothing is analysed here
+    if !bv(e, "stabilize") {
+        return;
+    }
     let method = if chv(e, "method") == 0 { TrackMethod::Position } else { TrackMethod::PositionScaleRotation };
-    let Some(path) = stabilizer_path(env, cx.seconds, method, bv(e, "detailed")) else { return };
+    let Some(path) = cached_stabilizer_path(env, method, bv(e, "detailed")) else { return };
     let n = path.steps.len() + 1;
     let k = ((cx.seconds * path.fps).round().max(0.0) as usize).min(n - 1);
     let smooth = fv(e, "smoothness", cx) as f64 / 100.0 * path.fps;
