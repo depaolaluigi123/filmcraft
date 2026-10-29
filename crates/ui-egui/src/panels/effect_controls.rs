@@ -261,6 +261,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     actions.push(("effects.select".into(), json!({"clip": clip.0, "effect": idx})));
                 }
                 let mut save_preset = false;
+                let mut apply_preset = None;
                 let fx_id = e.effect.clone();
                 resp.context_menu(|ui| {
                     let sp = ui.button(tl!("Save Preset…"));
@@ -269,13 +270,43 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         save_preset = true;
                         ui.close();
                     }
-                    if !def.intrinsic && ui.button(tl!("Clear")).clicked() {
-                        actions.push(("effects.remove".into(), json!({"clip": clip.0, "index": idx})));
+                    // Presets that configure this effect: choosing one replaces this instance's
+                    // settings in place instead of adding a duplicate effect below it.
+                    let ap = ui.menu_button(tl!("Apply Preset"), |ui| {
+                        let mine: Vec<String> =
+                            app.session.presets.all().into_iter().filter(|p| p.effects.iter().any(|x| x.effect == fx_id)).map(|p| p.name).collect();
+                        if mine.is_empty() {
+                            ui.add_enabled(false, egui::Button::new(tl!("No Presets for This Effect")));
+                        }
+                        for name in mine {
+                            let b = ui.button(crate::i18n::t(&name));
+                            app.auto.add(&format!("effectControls.effect.{fx_id}.applyPreset.{name}"), b.rect, &name);
+                            if b.clicked() {
+                                apply_preset = Some(name);
+                                ui.close();
+                            }
+                        }
+                    });
+                    app.auto.add(&format!("effectControls.effect.{fx_id}.applyPreset"), ap.response.rect, "Apply Preset");
+                    let re = ui.button(tl!("Reset Effect"));
+                    app.auto.add(&format!("effectControls.effect.{fx_id}.reset"), re.rect, "Reset Effect");
+                    if re.clicked() {
+                        actions.push(("effects.reset".into(), json!({"clip": clip.0, "index": idx})));
                         ui.close();
+                    }
+                    if !def.intrinsic {
+                        ui.separator();
+                        if ui.button(tl!("Clear")).clicked() {
+                            actions.push(("effects.remove".into(), json!({"clip": clip.0, "index": idx})));
+                            ui.close();
+                        }
                     }
                 });
                 if save_preset {
                     crate::panels::presets::open_save(app, clip.0, vec![idx], def.name);
+                }
+                if let Some(name) = apply_preset {
+                    actions.push(("presets.applyEffect".into(), json!({"clip": clip.0, "index": idx, "preset": name})));
                 }
                 if !open {
                     continue;
